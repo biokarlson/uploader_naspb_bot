@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import posixpath
+import re
 import tempfile
 import time
 import uuid
@@ -78,8 +79,8 @@ ADMIN_COMMANDS = USER_COMMANDS + [
     BotCommand(command="settoken", description="Вставить токен вручную"),
     BotCommand(command="setroot", description="Корневая папка"),
     BotCommand(command="diskname", description="Название диска"),
-    BotCommand(command="adduser", description="Добавить пользователя"),
-    BotCommand(command="removeuser", description="Убрать пользователя"),
+    BotCommand(command="adduser", description="Добавить пользователей"),
+    BotCommand(command="removeuser", description="Убрать пользователей"),
     BotCommand(command="users", description="Список пользователей"),
     BotCommand(command="logout", description="Отключить диск"),
 ]
@@ -477,8 +478,8 @@ async def cmd_help(message: Message):
             "/settoken ТОКЕН — вставить OAuth-токен вручную\n"
             "/setroot [путь] — корневая папка диска\n"
             "/diskname [название] — название диска\n"
-            "/adduser ID — добавить пользователя\n"
-            "/removeuser ID — убрать пользователя\n"
+            "/adduser ID — добавить пользователей (один ID или список через запятую)\n"
+            "/removeuser ID — убрать пользователей (один ID или список через запятую)\n"
             "/users — список пользователей\n"
             "/logout — отключить диск (токен удаляется, список пользователей остаётся)"
         )
@@ -597,9 +598,37 @@ async def cmd_diskname(message: Message, command: CommandObject):
 
 # ---------------------------------------------------------------- Админ: пользователи
 
-def parse_user_id(command: CommandObject) -> int | None:
-    arg = (command.args or "").strip()
-    return int(arg) if arg.isdigit() else None
+MAX_IDS_PER_COMMAND = 50
+
+
+def parse_user_ids(command: CommandObject) -> tuple[list[int], list[str]]:
+    """Разбирает ID через запятую, пробел или перенос строки.
+    Возвращает (корректные ID без повторов, значения, не похожие на ID)."""
+    tokens = [t for t in re.split(r"[,;\s]+", (command.args or "").strip()) if t]
+    ids: list[int] = []
+    bad: list[str] = []
+    for t in tokens:
+        if t.isdigit():
+            n = int(t)
+            if n not in ids:
+                ids.append(n)
+        else:
+            bad.append(t)
+    return ids, bad
+
+
+def fmt_user(uid: int) -> str:
+    name = store.display(uid)
+    return str(uid) if name == str(uid) else f"{name} — {uid}"
+
+
+def fmt_list(title: str, ids: list[int]) -> str:
+    return title + "\n" + "\n".join(f"• {fmt_user(u)}" for u in ids)
+
+
+def fmt_bad(bad: list[str]) -> str:
+    shown = ", ".join(bad[:10]) + ("…" if len(bad) > 10 else "")
+    return f"⚠️ Не похоже на ID, пропущено: {shown}"
 
 
 @private.message(Command("adduser"))
@@ -607,41 +636,85 @@ async def cmd_adduser(message: Message, command: CommandObject):
     if not await require_admin(message):
         return
     uid = message.from_user.id
-    target = parse_user_id(command)
-    if target is None:
+    ids, bad = parse_user_ids(command)
+    if not ids and not bad:
         return await message.answer(
-            "Использование: /adduser ID\nID человека можно узнать у бота @userinfobot."
+            "Использование: /adduser ID\n"
+            "Можно сразу несколько: /adduser 111111111, 222222222, 333333333\n"
+            "ID человека можно узнать у бота @userinfobot."
         )
-    if target == uid:
-        return await message.answer("Ты и так админ этого диска.")
+    if len(ids) > MAX_IDS_PER_COMMAND:
+        return await message.answer(f"❌ За один раз можно указать не больше {MAX_IDS_PER_COMMAND} ID.")
+
     a = store.admin(uid)
-    if target in a["users"]:
-        return await message.answer("Этот человек уже в списке.")
-    a["users"].append(target)
-    store.save()
-    await message.answer(f"✅ Добавлен: {store.display(target)}")
-    try:
-        await bot.send_message(
-            target,
-            f"Вас добавили к диску «{store.label(uid)}». Отправьте мне файл, чтобы загрузить его.",
-        )
-    except (TelegramForbiddenError, TelegramBadRequest):
-        pass  # человек ещё не запускал бота — сообщить ему нужно самому
+    added: list[int] = []
+    existing: list[int] = []
+    me = False
+    for target in ids:
+        if target == uid:
+            me = True
+        elif target in a["users"]:
+            existing.append(target)
+        else:
+            a["users"].append(target)
+            added.append(target)
+    if added:
+        store.save()
+
+    parts = []
+    if added:
+        parts.append(fmt_list("✅ Добавлены:", added))
+    if existing:
+        parts.append(fmt_list("Уже в списке:", existing))
+    if me:
+        parts.append("Ты админ этого диска, себя добавлять не нужно.")
+    if bad:
+        parts.append(fmt_bad(bad))
+    await message.answer("\n\n".join(parts))
+
+    for target in added:
+        try:
+            await bot.send_message(
+                target,
+                f"Вас добавили к диску «{store.label(uid)}». Отправьте мне файл, чтобы загрузить его.",
+            )
+        except (TelegramForbiddenError, TelegramBadRequest):
+            pass  # человек ещё не запускал бота — сообщить ему нужно самому
 
 
 @private.message(Command("removeuser"))
 async def cmd_removeuser(message: Message, command: CommandObject):
     if not await require_admin(message):
         return
-    target = parse_user_id(command)
-    if target is None:
-        return await message.answer("Использование: /removeuser ID")
+    ids, bad = parse_user_ids(command)
+    if not ids and not bad:
+        return await message.answer(
+            "Использование: /removeuser ID\n"
+            "Можно сразу несколько: /removeuser 111111111, 222222222"
+        )
+    if len(ids) > MAX_IDS_PER_COMMAND:
+        return await message.answer(f"❌ За один раз можно указать не больше {MAX_IDS_PER_COMMAND} ID.")
+
     a = store.admin(message.from_user.id)
-    if target not in a["users"]:
-        return await message.answer("Этого человека нет в списке.")
-    a["users"].remove(target)
-    store.save()
-    await message.answer(f"✅ Убран: {store.display(target)}")
+    removed: list[int] = []
+    missing: list[int] = []
+    for target in ids:
+        if target in a["users"]:
+            a["users"].remove(target)
+            removed.append(target)
+        else:
+            missing.append(target)
+    if removed:
+        store.save()
+
+    parts = []
+    if removed:
+        parts.append(fmt_list("✅ Убраны:", removed))
+    if missing:
+        parts.append(fmt_list("Не было в списке:", missing))
+    if bad:
+        parts.append(fmt_bad(bad))
+    await message.answer("\n\n".join(parts))
 
 
 @private.message(Command("users"))
