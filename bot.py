@@ -7,6 +7,7 @@ Telegram-бот для загрузки файлов на Яндекс Диск.
     2) «Загрузить файл»   — доступно, если человека добавил какой-то админ.
   Админ управляет токеном, корневой папкой, названием диска и списком пользователей.
   Человек может быть в списках у нескольких админов — тогда бот спрашивает, на какой диск грузить.
+  В группах бот сначала спрашивает «Загрузить файл?», в личке этот вопрос пропускается.
 """
 import asyncio
 import json
@@ -22,7 +23,7 @@ from urllib.parse import urlencode
 
 import aiohttp
 import yadisk
-from aiogram import BaseMiddleware, Bot, Dispatcher, F
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandObject
 from aiogram.types import BotCommand, BotCommandScopeChat, CallbackQuery, Message
@@ -111,6 +112,10 @@ class Store:
     def admin(self, uid: int) -> dict | None:
         return self.admins.get(str(uid))
 
+    def is_relevant(self, uid: int) -> bool:
+        """Админ или человек из чьего-то списка (только таких запоминаем при общении в группах)."""
+        return self.is_admin(uid) or any(uid in a["users"] for a in self.admins.values())
+
     def create_admin(self, uid: int):
         if not self.is_admin(uid):
             self.admins[str(uid)] = {"token": None, "base_path": "/", "name": None, "users": []}
@@ -180,9 +185,12 @@ store = Store()
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Работаем только в личных чатах (токены нельзя светить в группах)
-dp.message.filter(F.chat.type == "private")
-dp.callback_query.filter(F.message.chat.type == "private")
+# Команды управления и всё, что связано с токенами, — только в личных чатах
+# (токены нельзя светить в группах). Загрузка файлов работает и в личке, и в группах.
+private = Router(name="private")
+private.message.filter(F.chat.type == "private")
+private.callback_query.filter(F.message.chat.type == "private")
+dp.include_router(private)
 
 
 class TouchMiddleware(BaseMiddleware):
@@ -190,8 +198,11 @@ class TouchMiddleware(BaseMiddleware):
 
     async def __call__(self, handler, event, data):
         user = data.get("event_from_user")
+        chat = data.get("event_chat")
         if user and not user.is_bot:
-            store.remember(user)
+            in_private = bool(chat and chat.type == "private")
+            if in_private or store.is_relevant(user.id):
+                store.remember(user)
         return await handler(event, data)
 
 
@@ -376,7 +387,7 @@ def token_failed_text(admin_id: int, user_id: int) -> str:
 
 # ---------------------------------------------------------------- /start, /help
 
-@dp.message(Command("start"))
+@private.message(Command("start"))
 async def cmd_start(message: Message):
     kb = InlineKeyboardBuilder()
     kb.button(text="🔗 Подключить диск", callback_data="s:connect")
@@ -410,7 +421,7 @@ async def begin_connect(target: Message, uid: int):
         )
 
 
-@dp.callback_query(F.data == "s:connect")
+@private.callback_query(F.data == "s:connect")
 async def cb_connect(cb: CallbackQuery):
     uid = cb.from_user.id
     store.create_admin(uid)
@@ -426,7 +437,7 @@ async def cb_connect(cb: CallbackQuery):
     await begin_connect(cb.message, uid)
 
 
-@dp.callback_query(F.data == "s:upload")
+@private.callback_query(F.data == "s:upload")
 async def cb_upload(cb: CallbackQuery):
     await cb.answer()
     if not store.disks_for(cb.from_user.id):
@@ -437,13 +448,15 @@ async def cb_upload(cb: CallbackQuery):
     )
 
 
-@dp.message(Command("help"))
+@private.message(Command("help"))
 async def cmd_help(message: Message):
     text = (
         "Как пользоваться:\n"
         "• Отправь файл (документ, фото, видео, аудио, голосовое) — бот спросит, "
         "на какой диск и в какую папку его положить.\n"
         "• /start — главное меню.\n"
+        "• В группе бот сначала спросит, нужно ли загружать файл (кнопки «Да» и «Нет»), "
+        "в личке этого вопроса нет.\n"
         "Если тебя нет в списке пользователей, обратись к админу диска.\n"
         "Обычный бот Telegram принимает файлы размером до 20 МБ."
     )
@@ -491,7 +504,7 @@ async def finish_code(message: Message, code: str):
     await message.answer(connected_text(uid))
 
 
-@dp.message(Command("code"))
+@private.message(Command("code"))
 async def cmd_code(message: Message, command: CommandObject):
     if not await require_admin(message):
         return
@@ -501,7 +514,7 @@ async def cmd_code(message: Message, command: CommandObject):
     await finish_code(message, code)
 
 
-@dp.message(Command("settoken"))
+@private.message(Command("settoken"))
 async def cmd_settoken(message: Message, command: CommandObject):
     if not await require_admin(message):
         return
@@ -525,7 +538,7 @@ async def cmd_settoken(message: Message, command: CommandObject):
     await message.answer(connected_text(uid) + note)
 
 
-@dp.message(Command("logout"))
+@private.message(Command("logout"))
 async def cmd_logout(message: Message):
     if not await require_admin(message):
         return
@@ -540,7 +553,7 @@ async def cmd_logout(message: Message):
 
 # ---------------------------------------------------------------- Админ: настройки
 
-@dp.message(Command("settings"))
+@private.message(Command("settings"))
 async def cmd_settings(message: Message):
     if not await require_admin(message):
         return
@@ -554,7 +567,7 @@ async def cmd_settings(message: Message):
     )
 
 
-@dp.message(Command("diskname"))
+@private.message(Command("diskname"))
 async def cmd_diskname(message: Message, command: CommandObject):
     if not await require_admin(message):
         return
@@ -580,7 +593,7 @@ def parse_user_id(command: CommandObject) -> int | None:
     return int(arg) if arg.isdigit() else None
 
 
-@dp.message(Command("adduser"))
+@private.message(Command("adduser"))
 async def cmd_adduser(message: Message, command: CommandObject):
     if not await require_admin(message):
         return
@@ -607,7 +620,7 @@ async def cmd_adduser(message: Message, command: CommandObject):
         pass  # человек ещё не запускал бота — сообщить ему нужно самому
 
 
-@dp.message(Command("removeuser"))
+@private.message(Command("removeuser"))
 async def cmd_removeuser(message: Message, command: CommandObject):
     if not await require_admin(message):
         return
@@ -622,7 +635,7 @@ async def cmd_removeuser(message: Message, command: CommandObject):
     await message.answer(f"✅ Убран: {store.display(target)}")
 
 
-@dp.message(Command("users"))
+@private.message(Command("users"))
 async def cmd_users(message: Message):
     if not await require_admin(message):
         return
@@ -635,7 +648,7 @@ async def cmd_users(message: Message):
 
 # ---------------------------------------------------------------- Админ: корневая папка
 
-@dp.message(Command("setroot"))
+@private.message(Command("setroot"))
 async def cmd_setroot(message: Message, command: CommandObject):
     if not await require_admin(message):
         return
@@ -700,7 +713,7 @@ def browse_session(cb: CallbackQuery, key: str) -> dict | None:
     return st
 
 
-@dp.callback_query(F.data.startswith("be:"))
+@private.callback_query(F.data.startswith("be:"))
 async def browse_enter(cb: CallbackQuery):
     _, key, idx = cb.data.split(":")
     st = browse_session(cb, key)
@@ -711,7 +724,7 @@ async def browse_enter(cb: CallbackQuery):
     await render_browser(key, cb.message)
 
 
-@dp.callback_query(F.data.startswith("bu:"))
+@private.callback_query(F.data.startswith("bu:"))
 async def browse_up(cb: CallbackQuery):
     key = cb.data.split(":")[1]
     st = browse_session(cb, key)
@@ -722,7 +735,7 @@ async def browse_up(cb: CallbackQuery):
     await render_browser(key, cb.message)
 
 
-@dp.callback_query(F.data.startswith("bs:"))
+@private.callback_query(F.data.startswith("bs:"))
 async def browse_select(cb: CallbackQuery):
     key = cb.data.split(":")[1]
     st = browse_session(cb, key)
@@ -735,7 +748,7 @@ async def browse_select(cb: CallbackQuery):
     await cb.answer()
 
 
-@dp.callback_query(F.data.startswith("bx:"))
+@private.callback_query(F.data.startswith("bx:"))
 async def browse_cancel(cb: CallbackQuery):
     key = cb.data.split(":")[1]
     if browse_session(cb, key):
@@ -746,7 +759,7 @@ async def browse_cancel(cb: CallbackQuery):
 
 # ---------------------------------------------------------------- Загрузка файлов
 
-@dp.message(F.text & ~F.text.startswith("/"))
+@private.message(F.text & ~F.text.startswith("/"))
 async def on_text(message: Message):
     if message.from_user.id in awaiting_code:
         return await finish_code(message, message.text.strip())
@@ -755,11 +768,19 @@ async def on_text(message: Message):
 
 @dp.message(F.document | F.photo | F.video | F.audio | F.voice | F.video_note)
 async def on_file(message: Message):
+    if not message.from_user:
+        return
     uid = message.from_user.id
+    in_group = message.chat.type != "private"
+
     disks = store.disks_for(uid)
     if not disks:
+        if in_group:
+            return  # в группе тем, кого нет в списках, не отвечаем
         return await message.reply(not_in_list_text(uid))
     if rate_limited(uid):
+        if in_group:
+            return
         return await message.reply("⏳ Слишком много файлов подряд. Подожди минуту.")
 
     info = extract_file(message)
@@ -779,17 +800,60 @@ async def on_file(message: Message):
         "ts": time.monotonic(),
     }
 
+    if in_group:
+        # В группе сначала спрашиваем, нужно ли вообще загружать этот файл
+        kb = InlineKeyboardBuilder()
+        kb.button(text="✅ Да", callback_data=f"g:{key}:y")
+        kb.button(text="✖️ Нет", callback_data=f"g:{key}:n")
+        kb.adjust(2)
+        return await message.reply(
+            f"Загрузить «{name}» на Яндекс Диск?", reply_markup=kb.as_markup()
+        )
+
+    # В личке вопрос пропускаем — сразу выбор диска/папки
+    sent = await message.reply("Минутку…")
+    await proceed(key, sent)
+
+
+async def proceed(key: str, target: Message):
+    """Следующий шаг: выбор диска (если их несколько) или сразу выбор папки."""
+    p = pending[key]
+    disks = p["disks"]
     if len(disks) == 1:
-        pending[key]["admin_id"] = disks[0]
-        sent = await message.reply("Загружаю список папок…")
-        return await show_folders(key, sent)
+        p["admin_id"] = disks[0]
+        await target.edit_text("Загружаю список папок…")
+        return await show_folders(key, target)
 
     kb = InlineKeyboardBuilder()
     for i, label in enumerate(disk_labels(disks)):
         kb.button(text=f"💽 {label}", callback_data=f"d:{key}:{i}")
     kb.button(text="✖️ Отмена", callback_data=f"x:{key}")
     kb.adjust(1)
-    await message.reply(f"На какой диск загрузить «{name}»?", reply_markup=kb.as_markup())
+    await target.edit_text(
+        f"На какой диск загрузить «{p['name']}»?", reply_markup=kb.as_markup()
+    )
+
+
+@dp.callback_query(F.data.startswith("g:"))
+async def on_group_confirm(cb: CallbackQuery):
+    _, key, answer = cb.data.split(":")
+    p = pending.get(key)
+    if not p:
+        return await cb.answer("Запрос устарел, отправь файл заново.", show_alert=True)
+    if p["user_id"] != cb.from_user.id:
+        return await cb.answer("Это не твой файл.", show_alert=True)
+
+    if answer == "n":
+        pending.pop(key, None)
+        await cb.answer()
+        try:
+            await cb.message.delete()  # не засоряем группу
+        except TelegramBadRequest:
+            await cb.message.edit_text("Хорошо, этот файл не загружаю.")
+        return
+
+    await cb.answer()
+    await proceed(key, cb.message)
 
 
 async def show_folders(key: str, target: Message):
