@@ -18,6 +18,7 @@ import tempfile
 import time
 import uuid
 from collections import defaultdict, deque
+from contextlib import aclosing
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -26,7 +27,13 @@ import yadisk
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandObject
-from aiogram.types import BotCommand, BotCommandScopeChat, CallbackQuery, Message
+from aiogram.types import (
+    BotCommand,
+    BotCommandScopeChat,
+    CallbackQuery,
+    InlineKeyboardButton,
+    Message,
+)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from cryptography.fernet import Fernet, InvalidToken
 from dotenv import load_dotenv
@@ -42,7 +49,9 @@ CLIENT_SECRET = os.getenv("YANDEX_CLIENT_SECRET", "").strip()
 RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "10"))
 
 DATA_FILE = Path(__file__).parent / "data.json"
-MAX_FOLDER_BUTTONS = 90  # лимит Telegram: 100 кнопок на клавиатуру
+MAX_FOLDER_BUTTONS = 90  # лимит Telegram: 100 кнопок на клавиатуру (выбор корня в /setroot)
+PAGE_SIZE = 8  # папок на странице при выборе папки для загрузки
+SUBCHECK_LIMIT = 100  # сколько элементов папки просматриваем при проверке на подпапки
 MAX_DISKNAME_LEN = 30
 SESSION_TTL = 3600  # сколько секунд живут неотвеченные запросы выбора папки/диска
 
@@ -820,7 +829,7 @@ async def proceed(key: str, target: Message):
     p = pending[key]
     disks = p["disks"]
     if len(disks) == 1:
-        p["admin_id"] = disks[0]
+        set_disk(p, disks[0])
         await target.edit_text("Загружаю список папок…")
         return await show_folders(key, target)
 
@@ -856,12 +865,55 @@ async def on_group_confirm(cb: CallbackQuery):
     await proceed(key, cb.message)
 
 
-async def show_folders(key: str, target: Message):
+def set_disk(p: dict, admin_id: int):
+    """Запоминает выбранный диск и сбрасывает навигацию на его корневую папку."""
+    base = store.admin(admin_id)["base_path"]
+    p.update(admin_id=admin_id, root=base, path=base, page=0, folders=[], subs={})
+
+
+async def has_subfolders(d: yadisk.AsyncClient, path: str) -> bool:
+    """Есть ли в папке подпапки. В очень большой папке полный перебор слишком долгий,
+    поэтому при достижении лимита на всякий случай считаем, что подпапки есть."""
+    count = 0
+    async with aclosing(d.listdir(path, limit=SUBCHECK_LIMIT)) as items:
+        async for item in items:
+            if item.type == "dir":
+                return True
+            count += 1
+            if count >= SUBCHECK_LIMIT:
+                return True
+    return False
+
+
+async def check_subfolders(admin_id: int, paths: list[str]) -> list[bool]:
+    """Параллельно проверяет, есть ли подпапки у каждой папки из списка."""
+    async with client_for(admin_id) as d:
+        results = await asyncio.gather(
+            *(has_subfolders(d, pth) for pth in paths), return_exceptions=True
+        )
+    flags = []
+    for r in results:
+        if isinstance(r, BaseException):
+            logging.warning("Не удалось проверить подпапки: %r", r)
+            flags.append(True)  # при сомнении показываем кнопку «открыть»
+        else:
+            flags.append(r)
+    return flags
+
+
+async def show_folders(key: str, target: Message, reload: bool = True):
+    """Показывает текущую папку: подпапки постранично. Кнопка «открыть» — только у папок с подпапками."""
     p = pending[key]
     admin_id = p["admin_id"]
-    base = store.admin(admin_id)["base_path"]
     try:
-        p["folders"] = await list_folders(admin_id, base)
+        if reload:
+            p["folders"] = await list_folders(admin_id, p["path"])
+            p["page"] = 0
+        first = p["page"] * PAGE_SIZE
+        page_items = p["folders"][first:first + PAGE_SIZE]
+        unknown = [path for _, path in page_items if path not in p["subs"]]
+        if unknown:
+            p["subs"].update(zip(unknown, await check_subfolders(admin_id, unknown)))
     except (NoDisk, yadisk.exceptions.UnauthorizedError):
         pending.pop(key, None)
         await notify_token_failed(admin_id, p["user_id"])
@@ -870,17 +922,105 @@ async def show_folders(key: str, target: Message):
         logging.exception("Не удалось получить список папок")
         pending.pop(key, None)
         return await target.edit_text(
-            "❌ Не удалось получить список папок. Возможно, корневая папка удалена — "
-            "сообщите админу диска."
+            "❌ Не удалось получить список папок (возможно, папка была удалена). "
+            "Отправь файл заново или сообщи админу диска."
         )
 
+    pages = max(1, -(-len(p["folders"]) // PAGE_SIZE))
     kb = InlineKeyboardBuilder()
-    kb.button(text=f"📁 {base}", callback_data=f"f:{key}:root")
-    for i, (folder_name, _) in enumerate(p["folders"][:MAX_FOLDER_BUTTONS]):
-        kb.button(text=f"📁 {folder_name}", callback_data=f"f:{key}:{i}")
-    kb.button(text="✖️ Отмена", callback_data=f"x:{key}")
-    kb.adjust(1)
-    await target.edit_text(f"Куда положить «{p['name']}»?", reply_markup=kb.as_markup())
+    for i, (folder_name, folder_path) in enumerate(page_items, start=first):
+        if p["subs"].get(folder_path):
+            kb.row(
+                InlineKeyboardButton(text=f"📁 {folder_name} ›", callback_data=f"o:{key}:{i}"),
+                InlineKeyboardButton(text="✅", callback_data=f"f:{key}:{i}"),
+            )
+        else:
+            kb.row(InlineKeyboardButton(text=f"📁 {folder_name}", callback_data=f"f:{key}:{i}"))
+
+    if pages > 1:
+        nav = []
+        if p["page"] > 0:
+            nav.append(InlineKeyboardButton(text="◀️", callback_data=f"p:{key}:{p['page'] - 1}"))
+        nav.append(
+            InlineKeyboardButton(text=f"{p['page'] + 1}/{pages}", callback_data=f"p:{key}:{p['page']}")
+        )
+        if p["page"] < pages - 1:
+            nav.append(InlineKeyboardButton(text="▶️", callback_data=f"p:{key}:{p['page'] + 1}"))
+        kb.row(*nav)
+
+    bottom = [InlineKeyboardButton(text="✅ Сюда", callback_data=f"f:{key}:cur")]
+    if p["path"] != p["root"]:
+        bottom.append(InlineKeyboardButton(text="⬆️ Вверх", callback_data=f"u:{key}"))
+    kb.row(*bottom)
+    kb.row(InlineKeyboardButton(text="✖️ Отмена", callback_data=f"x:{key}"))
+
+    text = f"Куда положить «{p['name']}»?\n📂 {p['path']}"
+    if not p["folders"]:
+        text += "\nПодпапок нет — нажми «✅ Сюда»."
+    elif any(p["subs"].get(fp) for _, fp in page_items):
+        text += "\n› — открыть папку, ✅ — загрузить в неё"
+    try:
+        await target.edit_text(text, reply_markup=kb.as_markup())
+    except TelegramBadRequest as e:
+        if "not modified" not in str(e).lower():
+            raise
+
+
+async def get_pending(cb: CallbackQuery, key: str) -> dict | None:
+    """Возвращает живой запрос текущего пользователя; иначе отвечает на нажатие и даёт None."""
+    p = pending.get(key)
+    if not p:
+        await cb.answer("Запрос устарел, отправь файл заново.", show_alert=True)
+        return None
+    if p["user_id"] != cb.from_user.id:
+        await cb.answer("Это не твой файл.", show_alert=True)
+        return None
+    if p["admin_id"] is not None and p["admin_id"] not in store.disks_for(cb.from_user.id):
+        pending.pop(key, None)
+        await cb.message.edit_text("Доступ к этому диску закрыт.")
+        await cb.answer()
+        return None
+    return p
+
+
+@dp.callback_query(F.data.startswith("o:"))
+async def on_open(cb: CallbackQuery):
+    _, key, idx = cb.data.split(":")
+    p = await get_pending(cb, key)
+    if not p:
+        return
+    if int(idx) >= len(p["folders"]):
+        return await cb.answer("Список устарел, отправь файл заново.", show_alert=True)
+    p["path"] = p["folders"][int(idx)][1]
+    await cb.answer()
+    await show_folders(key, cb.message)
+
+
+@dp.callback_query(F.data.startswith("u:"))
+async def on_up(cb: CallbackQuery):
+    key = cb.data.split(":")[1]
+    p = await get_pending(cb, key)
+    if not p:
+        return
+    if p["path"] != p["root"]:
+        parent = posixpath.dirname(p["path"].rstrip("/")) or "/"
+        root = p["root"].rstrip("/")
+        # выше корневой папки админа подниматься нельзя
+        p["path"] = parent if (parent == p["root"] or parent.startswith(root + "/")) else p["root"]
+    await cb.answer()
+    await show_folders(key, cb.message)
+
+
+@dp.callback_query(F.data.startswith("p:"))
+async def on_page(cb: CallbackQuery):
+    _, key, n = cb.data.split(":")
+    p = await get_pending(cb, key)
+    if not p:
+        return
+    pages = max(1, -(-len(p["folders"]) // PAGE_SIZE))
+    p["page"] = max(0, min(int(n), pages - 1))
+    await cb.answer()
+    await show_folders(key, cb.message, reload=False)
 
 
 @dp.callback_query(F.data.startswith("x:"))
@@ -907,7 +1047,7 @@ async def on_disk(cb: CallbackQuery):
         pending.pop(key, None)
         await cb.message.edit_text("Доступ к этому диску закрыт.")
         return await cb.answer()
-    p["admin_id"] = admin_id
+    set_disk(p, admin_id)
     await cb.answer()
     await cb.message.edit_text("Загружаю список папок…")
     await show_folders(key, cb.message)
@@ -928,10 +1068,13 @@ async def on_folder(cb: CallbackQuery):
         await cb.message.edit_text("Доступ к этому диску закрыт.")
         return await cb.answer()
 
-    if idx == "root":
-        folder_name = folder_path = store.admin(admin_id)["base_path"]
+    if idx == "cur":
+        folder_path = p["path"]
     else:
-        folder_name, folder_path = p["folders"][int(idx)]
+        if int(idx) >= len(p["folders"]):
+            return await cb.answer("Список устарел, отправь файл заново.", show_alert=True)
+        folder_path = p["folders"][int(idx)][1]
+    folder_name = folder_path
 
     pending.pop(key, None)
     disk_label = store.label(admin_id)
