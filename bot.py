@@ -79,6 +79,7 @@ ADMIN_COMMANDS = USER_COMMANDS + [
     BotCommand(command="settoken", description="Вставить токен вручную"),
     BotCommand(command="setroot", description="Корневая папка"),
     BotCommand(command="diskname", description="Название диска"),
+    BotCommand(command="ignore", description="Игнорируемые файлы"),
     BotCommand(command="adduser", description="Добавить пользователей"),
     BotCommand(command="removeuser", description="Убрать пользователей"),
     BotCommand(command="users", description="Список пользователей"),
@@ -126,9 +127,15 @@ class Store:
         """Админ или человек из чьего-то списка (только таких запоминаем при общении в группах)."""
         return self.is_admin(uid) or any(uid in a["users"] for a in self.admins.values())
 
+    def ignore_rules(self, uid: int) -> list[str]:
+        a = self.admin(uid)
+        return list(a.get("ignore", [])) if a else []
+
     def create_admin(self, uid: int):
         if not self.is_admin(uid):
-            self.admins[str(uid)] = {"token": None, "base_path": "/", "name": None, "users": []}
+            self.admins[str(uid)] = {
+                "token": None, "base_path": "/", "name": None, "users": [], "ignore": [],
+            }
             self.save()
 
     # --- токен (хранится зашифрованным)
@@ -325,6 +332,54 @@ async def exchange_code(code: str) -> str | None:
 
 # ---------------------------------------------------------------- Вспомогательное
 
+IGNORE_TYPES = {"photo", "video", "audio", "voice", "videonote", "document"}
+IGNORE_ALIASES = {
+    "фото": "photo", "видео": "video", "аудио": "audio", "музыка": "audio",
+    "голосовое": "voice", "голосовые": "voice", "голос": "voice",
+    "кружок": "videonote", "кружки": "videonote",
+    "видеосообщение": "videonote", "видеосообщения": "videonote",
+    "документ": "document", "документы": "document",
+}
+EXT_RE = re.compile(r"^(\.[a-z0-9_+\-]{1,15}){1,3}$")
+MAX_IGNORE_RULES = 50
+
+
+def parse_rule(token: str) -> str | None:
+    """Правило игнорирования: тип вложения или расширение с точкой. None, если не похоже."""
+    t = token.strip().casefold()
+    t = IGNORE_ALIASES.get(t, t)
+    if t in IGNORE_TYPES or EXT_RE.match(t):
+        return t
+    return None
+
+
+def file_kind(message: Message) -> str:
+    if message.document:
+        return "document"
+    if message.photo:
+        return "photo"
+    if message.video:
+        return "video"
+    if message.audio:
+        return "audio"
+    if message.voice:
+        return "voice"
+    return "videonote"
+
+
+def is_ignored(admin_id: int, kind: str, name: str) -> bool:
+    """Игнорирует ли диск админа файл такого типа/имени."""
+    rules = store.ignore_rules(admin_id)
+    lname = name.casefold()
+    for r in rules:
+        if r.startswith("."):
+            if lname.endswith(r):
+                return True
+        elif r == kind:
+            return True
+    return False
+
+
 def extract_file(message: Message) -> tuple[str, str] | None:
     """(file_id, имя файла) для любого поддерживаемого вложения."""
     if message.document:
@@ -478,6 +533,7 @@ async def cmd_help(message: Message):
             "/settoken ТОКЕН — вставить OAuth-токен вручную\n"
             "/setroot [путь] — корневая папка диска\n"
             "/diskname [название] — название диска\n"
+            "/ignore — какие файлы бот игнорирует (add / remove / clear)\n"
             "/adduser ID — добавить пользователей (один ID или список через запятую)\n"
             "/removeuser ID — убрать пользователей (один ID или список через запятую)\n"
             "/users — список пользователей\n"
@@ -573,8 +629,109 @@ async def cmd_settings(message: Message):
         f"Название диска: «{store.label(uid)}»\n"
         f"Диск: {'подключён' if a['token'] else 'не подключён'}\n"
         f"Корневая папка: {a['base_path']}\n"
-        f"Пользователей: {len(a['users'])}"
+        f"Пользователей: {len(a['users'])}\n"
+        f"Правил игнорирования: {len(a.get('ignore', []))}"
     )
+
+
+def fmt_rules(rules: list[str]) -> str:
+    types = [r for r in rules if not r.startswith(".")]
+    exts = [r for r in rules if r.startswith(".")]
+    lines = []
+    if types:
+        lines.append("Типы: " + ", ".join(types))
+    if exts:
+        lines.append("Расширения: " + ", ".join(exts))
+    return "\n".join(lines)
+
+
+def current_rules_text(rules: list[str]) -> str:
+    if not rules:
+        return "Список пуст — бот принимает все файлы."
+    return "Сейчас игнорируется:\n" + fmt_rules(rules)
+
+
+IGNORE_USAGE = (
+    "Какие файлы бот не принимает на твой диск:\n"
+    "/ignore — показать правила\n"
+    "/ignore add photo, voice, .exe — добавить\n"
+    "/ignore remove .exe — убрать\n"
+    "/ignore clear — очистить список\n\n"
+    "Типы: photo, video, audio, voice (голосовые), videonote (кружки), document.\n"
+    "Расширения пишутся с точкой: .exe, .zip.\n"
+    "Расширение проверяется по имени файла; у фото бот использует .jpg, у голосовых .ogg, у кружков .mp4."
+)
+
+
+@private.message(Command("ignore"))
+async def cmd_ignore(message: Message, command: CommandObject):
+    if not await require_admin(message):
+        return
+    a = store.admin(message.from_user.id)
+    rules = a.setdefault("ignore", [])
+
+    parts = (command.args or "").split(maxsplit=1)
+    action = parts[0].casefold() if parts else ""
+    rest = parts[1] if len(parts) > 1 else ""
+
+    if not action:
+        if not rules:
+            return await message.answer(current_rules_text(rules) + "\n\n" + IGNORE_USAGE)
+        return await message.answer(
+            current_rules_text(rules)
+            + "\n\nИзменить: /ignore add, /ignore remove, /ignore clear (подробнее: /ignore help)"
+        )
+    if action == "help":
+        return await message.answer(IGNORE_USAGE)
+    if action == "clear":
+        rules.clear()
+        store.save()
+        return await message.answer("✅ Список очищен — бот принимает все файлы.")
+    if action not in ("add", "remove"):
+        return await message.answer("Не понял команду.\n\n" + IGNORE_USAGE)
+
+    tokens = [t for t in re.split(r"[,;\s]+", rest.strip()) if t]
+    if not tokens:
+        return await message.answer(f"Укажи правила: /ignore {action} photo, .exe\n\n" + IGNORE_USAGE)
+
+    valid: list[str] = []
+    bad: list[str] = []
+    for t in tokens:
+        r = parse_rule(t)
+        if r is None:
+            bad.append(t)
+        elif r not in valid:
+            valid.append(r)
+
+    out = []
+    if action == "add":
+        new = [r for r in valid if r not in rules]
+        dup = [r for r in valid if r in rules]
+        if len(rules) + len(new) > MAX_IGNORE_RULES:
+            return await message.answer(f"❌ Правил не больше {MAX_IGNORE_RULES}.")
+        rules.extend(new)
+        if new:
+            store.save()
+            out.append("✅ Добавлено: " + ", ".join(new))
+        if dup:
+            out.append("Уже были: " + ", ".join(dup))
+    else:
+        gone = [r for r in valid if r in rules]
+        missing = [r for r in valid if r not in rules]
+        for r in gone:
+            rules.remove(r)
+        if gone:
+            store.save()
+            out.append("✅ Убрано: " + ", ".join(gone))
+        if missing:
+            out.append("Не было в списке: " + ", ".join(missing))
+    if bad:
+        out.append(
+            "⚠️ Не похоже на правило, пропущено: " + ", ".join(bad[:10])
+            + "\nПравило — это тип (photo, voice…) или расширение с точкой (.exe)."
+        )
+    out.append(current_rules_text(rules))
+    await message.answer("\n\n".join(out))
 
 
 @private.message(Command("diskname"))
@@ -860,15 +1017,25 @@ async def on_file(message: Message):
         if in_group:
             return  # в группе тем, кого нет в списках, не отвечаем
         return await message.reply(not_in_list_text(uid))
-    if rate_limited(uid):
-        if in_group:
-            return
-        return await message.reply("⏳ Слишком много файлов подряд. Подожди минуту.")
-
     info = extract_file(message)
     if not info:
         return
     file_id, name = info
+
+    # Оставляем только диски, где этот файл не в списке игнорируемых
+    kind = file_kind(message)
+    disks = [a for a in disks if not is_ignored(a, kind, name)]
+    if not disks:
+        if in_group:
+            return  # в группе молчим
+        return await message.reply(
+            "Этот файл не принимается (тип или расширение в списке игнорируемых)."
+        )
+
+    if rate_limited(uid):
+        if in_group:
+            return
+        return await message.reply("⏳ Слишком много файлов подряд. Подожди минуту.")
 
     purge(pending)
     key = uuid.uuid4().hex[:8]
